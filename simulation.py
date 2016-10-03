@@ -332,17 +332,18 @@ class PerTaskSamplingScheduler(Scheduler):
         """ Begins the process of placing the job and returns the probe events.
         """
         #TODO: add a task_id here?
-        #TODO: not sure: per-task sampling should sample at one time, or task-by-task?
-        probe_list = random.sample(range(get_param("num_workers")), get_param("probes_ratio"))
-        network_delay = get_param("network_delay")
-        probe = Probe(self, job, probe_list)
-        probe_event = [(current_time+network_delay, probe_event)] #TODO: make this event correct
+        probe_events_list = []
+        for i in range(job.num_tasks):
+          probe_list = random.sample(range(get_param("num_workers")), get_param("probes_ratio"))
+          network_delay = get_param("network_delay")
+          probe = Probe(self, job, probe_list)
+          probe_events_list.attach((current_time+network_delay, probe_event)) #TODO: make this event correct
 
         #TODO: test to see if this shuffle returns the same result every time
         # random.shuffle(servers_copy)
 
         assert(len(probe_list) <= len(self.workers)), "More probes than workers"
-        return probe_event
+        return probe_events_list
     
     def probe_completed(self, job, queue_lengths, current_time):
         """ Sends the task to worker(s) based on the result of the probe.
@@ -354,8 +355,6 @@ class PerTaskSamplingScheduler(Scheduler):
         task_arrival_time = current_time + get_param("network_delay") # Arrive worker.
         queue_lengths.sort(key = lambda k: k[1])
         worker_candidate_index = queue_lengths[0][0]
-        probe = Probe(self, job, probe_list)
-        events.append(another_probe)
         events.append((task_arrival_time, TaskArrival(worker_index, job)))
         return events
 
@@ -448,7 +447,7 @@ class TaskCompletion(Event):
         
 class Probe(Event):
     """ Event to probe a list of servers for their current queue length.
-    
+    Probe(self, job, probe_list)
     This event is used for both a probe and a probe reply to avoid copying
     state to a new event.  Whether the queue_lengths variable has been
     populated determines what type of event it's currently being used for. """
