@@ -21,6 +21,8 @@ data is collected using a StatsManager object.
 #Simulation.workers
 ##Remove user option, load_metric only returns total queue length
 ##Logging system.
+##Make netowrk delay global
+##Refactor Scheduler.assign_tasks() for late binding (ramdom, per-task batching still worl)
 import copy
 import logging
 import math
@@ -30,7 +32,7 @@ import collections
 import random
 import sys
 
-import stats as stats_mod
+# import stats as stats_mod
         
 # Log levels
 LEVELS = {'debug': logging.DEBUG,
@@ -127,7 +129,7 @@ PARAMS = {'num_schedulers': [int, 1],             # number of schedulers
           'relative_demands': [get_normalized_list, []],
           # comma separated list of relative weights with which to run tasks
           # for each user.  Currently, only integers are supported.
-          'worker_weights': [get_int_list, []]
+          'worker_weights': [get_int_list, []],
 
           'load': [float, 1] #TODO: how to change the load? confirm that load is the percentage of busy worker
 
@@ -259,8 +261,7 @@ class Worker(object):
         Begins running the task, if there are no other tasks in the queue.
         Returns a TaskCompletion event, if there are no tasks running.
         """
-        #TODO: re write Front End, use one queue.
-        job.task_counter++
+        (job.task_counter) += 1
         task_id = job.task_counter
         self.queue.append((task_id, job))
         self.stats_manager.task_queued(job.user_id, current_time)
@@ -273,9 +274,7 @@ class Worker(object):
         
         Returns a TaskCompletion for the next task, if one exists. """
         # task_finished(self.task_id, self.job, current_time)
-        assert(len(job.queue) > 0)
-        self.queue.remove((task_id, job)) # not finished
-        if len(job.queue) > 0:
+        if len(self.queue) > 0:
             return [self.__launch_task(current_time)]
         
     def __launch_task(self, current_time):
@@ -283,28 +282,13 @@ class Worker(object):
         
         Returns an event for the launched task's completion.
         """
-        #TODO: simplify below
-        assert len(self.queue) > 0
-        tasks_per_round = self.relative_weights[self.current_user]
-            
         self.task_count += 1
-        if self.task_count >= tasks_per_round:
-            # Move on to the next user.
-            self.task_count = 0
-            self.current_user = (self.current_user + 1) % self.num_users
-
-        while len(self.queues[self.current_user]) == 0:
-            self.current_user = (self.current_user + 1) % self.num_users
-            self.task_count = 0
-        # Get the first task from the queue
         task_id, job = self.queue.popleft()
-        # task_length, job = self.queues[self.current_user][0]
-        # assert job.user_id == self.current_user
-        event = (current_time + job.task_duration, TaskCompletion(task_id, job, self))
-        self.stats_manager.task_started(self.current_user, current_time)
-        self.time_started = current_time
+        task_end_time = current_time + job.task_duration
+        self.stats_manager.task_started(self.current_user, current_time) #TODO: check here
+        self.time_started = current_time #TODO: check here
 
-        return event
+        return [(task_end_time, TaskCompletionEvent(task_id, job, self))]
 
 
 class Scheduler(object):
@@ -328,28 +312,25 @@ class PerTaskSamplingScheduler(Scheduler):
         while len(self.queue_lengths) < len(workers):
             self.queue_lengths.append(0)
         
-    def place_job(self, job, current_time):
+    def assign_tasks(self, job, current_time):
         """ Begins the process of placing the job and returns the probe events.
+
+        Modified: Probe is finished here.
         """
-        #TODO: add a task_id here?
-        probe_events_list = []
-        for i in range(job.num_tasks):
+        loads = []
+        task_arrival_events = []
+        network_delay = get_param("network_delay")
+        for _ in range(job.num_tasks):
           probe_list = random.sample(range(get_param("num_workers")), get_param("probes_ratio"))
-          network_delay = get_param("network_delay")
-          probe = Probe(self, job, probe_list)
-          probe_events_list.attach((current_time+network_delay, probe_event)) #TODO: make this event correct
+          loads = [(i, Simulation.workers[i].probe_load()) for i in probe_list]
+          loads.sort(key = lambda x: x[1])
+          task_arrival_events.append((current_time + 2*network_delay,
+            TaskArrival(self.workers[loads[0][0]], job)))
 
-        #TODO: test to see if this shuffle returns the same result every time
-        # random.shuffle(servers_copy)
-
-        assert(len(probe_list) <= len(self.workers)), "More probes than workers"
-        return probe_events_list
+        return task_arrival_events
     
     def probe_completed(self, job, queue_lengths, current_time):
         """ Sends the task to worker(s) based on the result of the probe.
-
-        probe_completed(self.job, self.queue_lengths,
-                                                  current_time)
         """
         events = [] #TODO: this events is used to be compatiable with batch scheduler
         task_arrival_time = current_time + get_param("network_delay") # Arrive worker.
@@ -362,27 +343,20 @@ class PerTaskSamplingScheduler(Scheduler):
     # def get_best_n_queues(self, queue_lengths, n):
 
 
-class IdealScheduler (FrontEnd):
-    def __init__ (self):
-        super(IdealScheduler,self)
-        # When all workers are busy, put them in the Scheduler's queue
-        self.task_queue = Queue.PriorityQueue()
+class IdealScheduler (Scheduler):
+  pass
 
 
-class RandomSamplingScueduler (FrontEnd):
-    pass
+class RandomSamplingScueduler (Scheduler):
+  pass
 
 
-class PerTaskSamplingScheduler (FrontEnd):
-    pass
+class BatchSamplingScheduler (Scheduler):
+  pass
 
 
-class BatchSamplingScheduler (FrontEnd):
-    pass
-
-
-class LateBindingScheduler (FrontEnd):
-    pass
+class LateBindingScheduler (Scheduler):
+  pass
 
 
 ###############################################################################
@@ -422,10 +396,10 @@ class JobArrival(Event):
         self.scheduler = scheduler
         
     def run(self, current_time):
-        return self.scheduler.place_job(self.job, current_time)
+        return self.scheduler.assign_tasks(self.job, current_time)
     
 class TaskArrival(Event):
-    """ Event to handle a task arriving at a server. """
+    """ Event to handle a task arriving at a woker. """
     def __init__(self, worker_index, job):
         self.worker_index = worker_index
         self.job = job
@@ -434,7 +408,7 @@ class TaskArrival(Event):
         return Simulation.workers[self.worker_index].queue_task(self.job, 
           current_time)
         
-class TaskCompletion(Event):
+class TaskCompletionEvent(Event):
     """ Event to handle tasks completing. """
     def __init__(self, task_id, job, worker):
         self.task_id = task_id
@@ -445,29 +419,28 @@ class TaskCompletion(Event):
         self.job.task_finished(current_time) #TODO: need task_id here?
         return self.worker.task_finished(self.task_id, self.job, current_time)
         
-class Probe(Event):
-    """ Event to probe a list of servers for their current queue length.
-    Probe(self, job, probe_list)
-    This event is used for both a probe and a probe reply to avoid copying
-    state to a new event.  Whether the queue_lengths variable has been
-    populated determines what type of event it's currently being used for. """
+# class Probe(Event):
+#     """ Event to probe a list of servers for their current queue length.
 
-    def __init__(self, scheduler, job, workers):
-        self.scheduler = scheduler
-        self.job = job
-        self.workers = workers
-        self.queue_lengths = []
+#     This event is used for both a probe and a probe reply to avoid copying
+#     state to a new event.  Whether the queue_lengths variable has been
+#     populated determines what type of event it's currently being used for. """
+
+#     def __init__(self, scheduler, job, workers):
+#         self.scheduler = scheduler
+#         self.job = job
+#         self.workers = workers
+#         self.queue_lengths = []
     
-    def run(self, current_time):
-        if len(self.queue_lengths) == 0: # If this probe is not finished
-            # Need to collect state.
-            for worker_index in self.workers:
-                self.queue_lengths.append((worker_index,
-                                           Simulation.workers[worker_index].probe_load(current_time)))
-            return [(current_time + get_param("network_delay"), self)]
-        else: # If this probe is finished, and passed back to scheduler
-            return self.scheduler.probe_completed(self.job, self.queue_lengths,
-                                                  current_time)
+#     def run(self, current_time):
+#         if len(self.queue_lengths) == 0: # If this probe is not finished
+#             # Need to collect state.
+#             for worker_index in self.workers:
+#                 self.queue_lengths.append((worker_index,
+#                                            Simulation.workers[worker_index].probe_load(current_time)))
+#             return [(current_time + get_param("network_delay"), self)]
+#         else: # If this probe is finished, and passed back to scheduler
+#             return self.scheduler.probe_completed(self.job, self.queue_lengths, current_time)
 
 ###############################################################################
 #               Practical things needed for the simulation                    #
@@ -481,8 +454,8 @@ class StatsManager(object):
         # Total enqueued jobs per-user over time, stored as a list of
         # (time, queue_length) tuples.
         self.enqueued_tasks = []
-        for user in range(get_param("num_users")):
-            self.enqueued_tasks.append([])
+        # for user in range(get_param("num_users")):
+        #     self.enqueued_tasks.append([])
         self.completed_jobs = []
         
         # Number of running tasks for each user (indexed by user id).
@@ -491,8 +464,8 @@ class StatsManager(object):
         # List of (time, queue_length) tuples describing the total number of
         # running tasks in the cluster.
         self.total_running_tasks = []
-        for user in range(get_param("num_users")):
-            self.running_tasks.append([])
+        # for user in range(get_param("num_users")):
+        #     self.running_tasks.append([])
 
         self.logger = logging.getLogger("StatsManager")        
         
@@ -890,6 +863,7 @@ class Simulation(object):
         self.current_time_ms = 0
         self.event_queue = Queue.PriorityQueue()
         self.total_jobs = 0
+        self.job_completed = 0
         self.logger = logging.getLogger("Simulation")
         self.stats_manager = StatsManager()
         self.worker_weights = get_param("worker_weights")
@@ -945,7 +919,7 @@ class Simulation(object):
                     # between jobs follows an exponential distribution.  
                     new_last = last_job_arrival + \
                         random.expovariate(1.0/avg_arrival_delay)
-                else: 
+                else: raise NotImplementedError("Distribution not supported.")
 
                 # See if we've passed the end of the experiment
                 if new_last > total_time:
@@ -988,7 +962,8 @@ class Simulation(object):
                                                   query_interval)
             self.event_queue.put((query_interval, report_queue_state))
 
-        while len(self.stats_manager.completed_jobs) < self.total_jobs: 
+        # while len(self.stats_manager.completed_jobs) < self.total_jobs: #TODO: this condition should check
+        while self.job_completed < self.total_jobs:
         #TODO: make sure stats_manager.completed_jobs increases
             assert(not self.event_queue.empty()), "Event queue is empty before all jobs finish."
             current_time, event = self.event_queue.get() # Queue.get() will push
@@ -1026,19 +1001,19 @@ def main(argv):
         print ("Given value, %f, is not a valid probes_ratio" %
                get_param("probes_ratio"))
         sys.exit(0)
-    relative_demands = get_param("relative_demands")
-    if (relative_demands != [] and \
-        len(relative_demands) != get_param("num_users")):
-        print ("The length of relative demands does not match the "
-               "given number of users")
-        sys.exit(0)
+    # relative_demands = get_param("relative_demands")
+    # if (relative_demands != [] and \
+    #     len(relative_demands) != get_param("num_users")):
+    #     print ("The length of relative demands does not match the "
+    #            "given number of users")
+    #     sys.exit(0)
     
-    relative_weights = get_param("relative_weights")
-    if (relative_weights != [] and \
-        len(relative_weights) != get_param("num_users")):
-        print ("The length of relative weights does not match the "
-               "given number of users")
-        sys.exit(0)
+    # relative_weights = get_param("relative_weights")
+    # if (relative_weights != [] and \
+    #     len(relative_weights) != get_param("num_users")):
+    #     print ("The length of relative weights does not match the "
+    #            "given number of users")
+    #     sys.exit(0)
 
     logging.basicConfig(level=LEVELS.get(get_param('log_level')))
 
